@@ -8,9 +8,9 @@ from utils.params import ParamDict
 class NuScenesDataset:
 
     DEFAULT_PARAMS = ParamDict(
-        seq_len = 60,
+        seq_len = 4,
         max_scene_len = 189,
-        batch_size = 16,
+        batch_size = 32,
         data_root = "/data/tfrecords/nuScenes/front_cam",
         img_size = (143, 255),
         img_noise = 5.0,
@@ -28,7 +28,7 @@ class NuScenesDataset:
         file_dataset = file_dataset.take(num_files - num_files % self.p.batch_size)
 
         interleaved_dataset = file_dataset.interleave(self._interleave_func,
-            cycle_length=self.p.batch_size, num_parallel_calls=tf.data.AUTOTUNE, deterministic=True)
+            cycle_length=self.p.batch_size, num_parallel_calls=8, deterministic=True)
 
         batched_dataset = interleaved_dataset.padded_batch(self.p.batch_size, drop_remainder=True)
 

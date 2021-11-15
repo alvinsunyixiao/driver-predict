@@ -1,5 +1,6 @@
 import argparse
 import math
+import os
 import tensorflow as tf
 import tensorflow.keras as K
 
@@ -7,12 +8,12 @@ from dnn.data import NuScenesDataset
 from dnn.loss import LossManager
 from dnn.model import DPNet
 from utils.params import ParamDict
-from utils.tf_utils import set_tf_memory_growth
 
 class Trainer:
 
     DEFAULT_PARAMS = ParamDict(
-
+        num_epochs = 100,
+        save_freq = 10,
     )
 
     def __init__(self):
@@ -21,13 +22,14 @@ class Trainer:
         self.network = DPNet(self.p.model, self.p.data)
         self.loss = LossManager(self.network)
         self.data = NuScenesDataset(self.p.data)
-        self.dataiter = iter(self.data.dataset)
         self.optimizer = K.optimizers.Adam(1e-3)
 
     def _parse_args(self):
         parser = argparse.ArgumentParser()
         parser.add_argument("-p", "--params", type=str, required=True,
                             help="path to the parameter file")
+        parser.add_argument("-o", "--output", type=str, required=True,
+                            help="path to store weights")
 
         return parser.parse_args()
 
@@ -70,7 +72,10 @@ class Trainer:
                                                 "init_z_hist": outputs["z_hist"]}
 
     @tf.function
-    def _train_step(self, dataiter: tf.data.Iterator):
+    def _train_step(self,
+                    dataiter: tf.data.Iterator,
+                    optimizer: K.optimizers.Optimizer):
+
         optional = dataiter.get_next_as_optional()
         if not optional.has_value():
             return False
@@ -79,30 +84,38 @@ class Trainer:
             # generate offset based on first measurement
             data = optional.get_value()
             offset = self._generate_state_offset(data)
-            init_states = self.network.get_init_state()
-            loss, init_states = self._single_time_loss(data, offset, init_states)
+            init_states = self.network.get_init_state(data["image_bhw3"], data["state_b3"])
+            loss = 0.0
 
             # loop through subsequent timesteps
             for i in tf.range(self.data.p.seq_len - 1):
                 data = dataiter.get_next()
-                if i < 10:
-                    tmp_loss, init_states = self._single_time_loss(data, offset, init_states)
-                    loss += tmp_loss
+                tmp_loss, init_states = self._single_time_loss(data, offset, init_states)
+                loss += tmp_loss
 
             # add regularization loss
             loss += sum(self.network.model.losses)
 
-        grads = tape.gradient(loss, self.network.model.trainable_weights)
-        self.optimizer.apply_gradients(zip(grads, self.network.model.trainable_weights))
+        tf.print("Loss:", loss)
+
+        grads = tape.gradient(loss, self.network.model.trainable_variables)
+        #for grad, var in zip(grads, self.network.model.trainable_variables):
+        #    tf.print(var.name, tf.norm(grad), tf.reduce_min(var), tf.reduce_max(var))
+        optimizer.apply_gradients(zip(grads, self.network.model.trainable_variables))
 
         return True
 
     def train(self):
-        while True:
-            if not self._train_step(self.dataiter):
-                break
-        self.dataiter = iter(self.data.dataset)
+        for i in range(self.p.trainer.num_epochs):
+            dataiter = iter(self.data.dataset)
+            while True:
+                if not self._train_step(dataiter, self.optimizer):
+                    break
+
+            # save model
+            if i % self.p.trainer.save_freq == 0:
+                model_path = os.path.join(self.args.output, f"epoch-{i}")
+                self.network.model.save_weights(model_path)
 
 if __name__ == "__main__":
-    set_tf_memory_growth()
     Trainer().train()

@@ -31,8 +31,8 @@ class MLP(KL.Layer):
             layers.append(KL.Dense(
                 units=hidden_units,
                 activation="elu",
-                kernel_regularizer=K.regularizers.l2(1e-4),
-                bias_regularizer=K.regularizers.l2(1e-4),
+                #kernel_regularizer=K.regularizers.l2(1e-4),
+                #bias_regularizer=K.regularizers.l2(1e-4),
             ))
             # dropout
             if dropout is not None:
@@ -51,7 +51,7 @@ class ImageEncoder(KL.Layer):
         self.units = units
         self.dropout = dropout
 
-        reg = K.regularizers.l2(1e-4)
+        reg = None #K.regularizers.l2(1e-4)
         self.cnn = K.Sequential([
             KL.Conv2D(24, 7, 2, activation="elu", kernel_regularizer=reg, bias_regularizer=reg),
             KL.Conv2D(24, 5, 1, activation="elu", kernel_regularizer=reg, bias_regularizer=reg),
@@ -78,7 +78,7 @@ class ImageDecoder(KL.Layer):
         self.feat_shape = feat_shape
         self.dropout = dropout
 
-        reg = K.regularizers.l2(1e-4)
+        reg = None #K.regularizers.l2(1e-4)
         self.mlp = MLP(math.prod(feat_shape), hidden_units=512, num_layers=1, dropout=dropout)
         self.decnn = K.Sequential([
             KL.Conv2DTranspose(96, 3, 2, activation="elu", output_padding=(0, 1),
@@ -97,7 +97,7 @@ class ImageDecoder(KL.Layer):
                                kernel_regularizer=reg, bias_regularizer=reg),
             KL.Conv2DTranspose(24, 5, 1, activation="elu",
                                kernel_regularizer=reg, bias_regularizer=reg),
-            KL.Conv2DTranspose(3, 7, 2, activation="elu",
+            KL.Conv2DTranspose(3, 7, 2, activation=None,
                                kernel_regularizer=reg, bias_regularizer=reg),
         ])
 
@@ -113,7 +113,7 @@ class LTVDynamics(KL.Layer):
 
     MLP_HIDDEN_UNITS = 128
     MLP_NUM_LAYERS = 2
-    MLP_DROPOUT = 0.3
+    MLP_DROPOUT = None
 
     def __init__(self,
                  state_units: int,
@@ -130,9 +130,9 @@ class LTVDynamics(KL.Layer):
         self.num_modes = num_modes
         self.gru = KL.GRUCell(
             units=state_history_units,
-            kernel_regularizer=K.regularizers.l2(1e-4),
-            recurrent_regularizer=K.regularizers.l2(1e-4),
-            bias_regularizer=K.regularizers.l2(1e-4),
+            #kernel_regularizer=K.regularizers.l2(1e-4),
+            #recurrent_regularizer=K.regularizers.l2(1e-4),
+            #bias_regularizer=K.regularizers.l2(1e-4),
         )
         self.alpha = MLP(
             output_units=num_modes,
@@ -142,7 +142,7 @@ class LTVDynamics(KL.Layer):
         )
 
         self.state_size = [
-            tf.TensorShape([state_units]),           # z
+            tf.TensorShape([state_units]),              # z
             tf.TensorShape([state_units, state_units]), # Pz
             tf.TensorShape([state_history_units]),      # z_hist
         ]
@@ -153,12 +153,24 @@ class LTVDynamics(KL.Layer):
         ]
 
     def build(self, input_shapes):
-        self.As = self.add_weight(name="As",
-            shape=(self.num_modes, self.state_units * self.state_units))
-        self.Bs = self.add_weight(name="Bs",
-            shape=(self.num_modes, self.state_units * self.control_units))
-        self.Cs = self.add_weight(name="Cs",
-            shape=(self.num_modes, self.observe_units * self.state_units))
+        self.As = self.add_weight(
+            name="As",
+            shape=(self.num_modes, self.state_units * self.state_units),
+            trainable=True,
+            initializer=K.initializers.random_normal(stddev=0.05),
+        )
+        self.Bs = self.add_weight(
+            name="Bs",
+            shape=(self.num_modes, self.state_units * self.control_units),
+            trainable=True,
+            initializer=K.initializers.random_normal(stddev=0.05),
+        )
+        self.Cs = self.add_weight(
+            name="Cs",
+            shape=(self.num_modes, self.observe_units * self.state_units),
+            trainable=True,
+            initializer=K.initializers.random_normal(stddev=0.05),
+        )
 
     def call(self, inputs, states, training=None):
         u, Pu = inputs
@@ -231,12 +243,10 @@ class DPNet:
         state_enc_units = 32,
         state_units = 3,
         control_units = 2,
-        z_units = 256,
-        z_hist_units = 256,
-        num_linear_modes = 8,
-        mlp_units = 256,
-        mlp_layers = 4,
-        mlp_dropout = 0.3,
+        z_units = 128,
+        z_hist_units = 196,
+        num_linear_modes = 4,
+        mlp_dropout = None,
     )
 
     def __init__(self,
@@ -249,8 +259,11 @@ class DPNet:
         image_shape = (None,) + self.data_p.img_size + (3,)
         feat_shape = self.img_encoder.cnn.compute_output_shape(image_shape)
         self.img_decoder = ImageDecoder(feat_shape[1:], dropout=self.p.mlp_dropout)
-        self.state_encoder = MLP(self.p.state_enc_units, 64, 2, self.p.mlp_dropout)
-        self.state_decoder = MLP(self.p.state_units, 64, 2, self.p.mlp_dropout)
+        self.state_encoder = MLP(
+            self.p.state_enc_units, 64, 1, self.p.mlp_dropout, name="state_encoder")
+        self.state_decoder = MLP(
+            self.p.state_units, 64, 1, self.p.mlp_dropout, name="state_decoder")
+        self.z_init_mlp = MLP(self.p.z_units, 256, 1)
 
         self.dynamics = KL.RNN(LTVDynamics(
             state_units=self.p.z_units,
@@ -258,17 +271,25 @@ class DPNet:
             control_units=self.p.control_units,
             observe_units=self.p.img_enc_units + self.p.state_enc_units,
             num_modes=self.p.num_linear_modes,
+            name="ltv_dynamics",
         ), return_state=True)
         self.kalman_meas = KalmanMeasure(
             state_units=self.p.z_units,
             observe_units=self.p.img_enc_units + self.p.state_enc_units,
+            name="kalman_meas",
         )
         self.model = self.build_model()
 
-    def get_init_state(self):
+    def get_init_state(self, image_bhw3, state_b3):
+        image_code = self.img_encoder(image_bhw3)
+        state_code = self.state_encoder(state_b3)
+        y = tf.concat([image_code, state_code], axis=-1)
+
+        init_z = self.z_init_mlp(y)
+
         states = self.dynamics.cell.get_initial_state(batch_size=self.data_p.batch_size)
         return {
-            "init_z": states[0],
+            "init_z": init_z,
             "init_Pz": states[1],
             "init_z_hist": states[2],
         }
@@ -294,6 +315,8 @@ class DPNet:
         # observation
         img_code = self.img_encoder(img_bhw3)
         state_code = self.state_encoder(state_b3)
+        img_recon = self.img_decoder(img_code)
+        state_recon = self.state_decoder(state_code)
         y = KL.Concatenate()([img_code, state_code])
 
         corrected_state = self.kalman_meas({
@@ -324,6 +347,10 @@ class DPNet:
                 "Pz_meas": corrected_state["Pz"],
                 "y_meas": corrected_state["y"],
                 "z_hist": z_hist,
+                # auxiliary outputs
+                "img_recon": img_recon,
+                "state_recon": state_recon,
+                "init_z": self.z_init_mlp(y),
             },
         )
 
