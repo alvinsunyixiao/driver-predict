@@ -12,7 +12,10 @@ class NuScenesDataset:
         max_scene_len = 189,
         batch_size = 16,
         data_root = "/data/tfrecords/nuScenes/front_cam",
-        img_size = (225, 400),
+        img_size = (143, 255),
+        img_noise = 5.0,
+        prefetch = 16,
+
     )
 
     def __init__(self, params: ParamDict = DEFAULT_PARAMS):
@@ -20,11 +23,16 @@ class NuScenesDataset:
         self.dataset = self.build_dataset()
 
     def build_dataset(self):
-        file_dataset = tf.data.Dataset.list_files(
-                os.path.join(self.p.data_root, "*.tfrecord"))
+        file_dataset = tf.data.Dataset.list_files(os.path.join(self.p.data_root, "*.tfrecord"))
+        num_files = file_dataset.cardinality().numpy()
+        file_dataset = file_dataset.take(num_files - num_files % self.p.batch_size)
+
         interleaved_dataset = file_dataset.interleave(self._interleave_func,
-                cycle_length=self.p.batch_size, num_parallel_calls=tf.data.AUTOTUNE)
-        return interleaved_dataset.padded_batch(self.p.batch_size, drop_remainder=True)
+            cycle_length=self.p.batch_size, num_parallel_calls=tf.data.AUTOTUNE, deterministic=True)
+
+        batched_dataset = interleaved_dataset.padded_batch(self.p.batch_size, drop_remainder=True)
+
+        return batched_dataset.prefetch(self.p.prefetch)
 
     def _interleave_func(self, file):
         raw_dataset = tf.data.TFRecordDataset(file)
@@ -59,15 +67,19 @@ class NuScenesDataset:
         can_ang_vel_t3.set_shape([None, 3])
 
         world_Rxyz_ego = tfg_transform.euler.from_quaternion(world_R_ego_4)
-        ctrl_size = tf.shape(can_lin_accel_t3)[0]
+
+        image_hw3 = tf.image.resize(image_hw3, self.p.img_size)
+        image_hw3 += tf.random.normal(shape=tf.shape(image_hw3), stddev=self.p.img_noise)
+        image_hw3 = image_hw3 / 127.5 - 1
+
+        state_b3 = tf.concat([world_t_ego_3[:-1], world_Rxyz_ego[-1, None]], axis=0)
+        ctrl_inputs_t2 = tf.concat(
+            [can_lin_accel_t3[:, 0, None], can_ang_vel_t3[:, -1, None]], axis=-1)
 
         return {
-            "image_bhw3": tf.image.resize(image_hw3, self.p.img_size),
-            "world_t_ego_b2": world_t_ego_3[:-1],
-            "world_R_ego_b": world_Rxyz_ego[-1],
-            "ctrl_lin_accel_bt3": can_lin_accel_t3,
-            "ctrl_ang_vel_bt3": can_ang_vel_t3,
-            "ctrl_mask_bt": tf.ones(ctrl_size),
-            "ctrl_size_b": ctrl_size,
+            "image_bhw3": image_hw3,
+            "state_b3": state_b3,
+            "ctrl_inputs_bt2": ctrl_inputs_t2,
+            "ctrl_mask_bt": tf.ones(tf.shape(can_lin_accel_t3)[0]),
         }
 
