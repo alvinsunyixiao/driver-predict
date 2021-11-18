@@ -11,6 +11,8 @@ class LossManager:
         y_proc_dist = tfp.distributions.MultivariateNormalTriL(
             loc=y_proc, scale_tril=tf.linalg.cholesky(Py_proc))
 
+        tf.print(y_proc_dist.stddev())
+
         y_loss = self.latent_meas_loss(y, y_proc_dist)
         img_loss, state_loss = self.decoded_loss(img_bhw3, state_b3, y, y_proc_dist)
 

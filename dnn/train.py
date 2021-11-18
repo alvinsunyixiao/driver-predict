@@ -67,9 +67,8 @@ class Trainer:
                  "img_loss:", img_loss,
                  "state_loss:", state_loss)
 
-        return y_loss + img_loss + state_loss, {"init_z": outputs["z_meas"],
-                                                "init_Pz": outputs["Pz_meas"],
-                                                "init_z_hist": outputs["z_hist"]}
+        return y_loss + img_loss + state_loss, \
+               {"init_state": tf.concat([outputs["z_meas"], outputs["z_log_var_meas"]], axis=-1)}
 
     @tf.function
     def _train_step(self,

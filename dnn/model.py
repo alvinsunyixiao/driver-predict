@@ -109,7 +109,7 @@ class ImageDecoder(KL.Layer):
         return x
 
 
-class LTVDynamics(KL.Layer):
+class GRUDynamics(KL.Layer):
 
     MLP_HIDDEN_UNITS = 128
     MLP_NUM_LAYERS = 2
@@ -117,93 +117,18 @@ class LTVDynamics(KL.Layer):
 
     def __init__(self,
                  state_units: int,
-                 state_history_units: int,
-                 control_units: int,
-                 observe_units: int,
-                 num_modes: int,
                  **kwargs):
-        super(LTVDynamics, self).__init__(**kwargs)
+        super(GRUDynamics, self).__init__(**kwargs)
         self.state_units = state_units
-        self.state_history_units = state_history_units
-        self.control_units = control_units
-        self.observe_units = observe_units
-        self.num_modes = num_modes
-        self.gru = KL.GRUCell(
-            units=state_history_units,
-            #kernel_regularizer=K.regularizers.l2(1e-4),
-            #recurrent_regularizer=K.regularizers.l2(1e-4),
-            #bias_regularizer=K.regularizers.l2(1e-4),
-        )
-        self.alpha = MLP(
-            output_units=num_modes,
-            hidden_units=self.MLP_HIDDEN_UNITS,
-            num_layers=self.MLP_NUM_LAYERS,
-            dropout=self.MLP_DROPOUT,
-        )
+        self.gru = KL.GRU(2 * state_units, activation=None)
 
-        self.state_size = [
-            tf.TensorShape([state_units]),              # z
-            tf.TensorShape([state_units, state_units]), # Pz
-            tf.TensorShape([state_history_units]),      # z_hist
-        ]
-        self.output_size = [
-            tf.TensorShape([observe_units]),                # y
-            tf.TensorShape([observe_units, observe_units]), # Py
-            tf.TensorShape([observe_units, state_units]),   # Ct
-        ]
-
-    def build(self, input_shapes):
-        self.As = self.add_weight(
-            name="As",
-            shape=(self.num_modes, self.state_units * self.state_units),
-            trainable=True,
-            initializer=K.initializers.random_normal(stddev=0.05),
-        )
-        self.Bs = self.add_weight(
-            name="Bs",
-            shape=(self.num_modes, self.state_units * self.control_units),
-            trainable=True,
-            initializer=K.initializers.random_normal(stddev=0.05),
-        )
-        self.Cs = self.add_weight(
-            name="Cs",
-            shape=(self.num_modes, self.observe_units * self.state_units),
-            trainable=True,
-            initializer=K.initializers.random_normal(stddev=0.05),
-        )
-
-    def call(self, inputs, states, training=None):
-        u, Pu = inputs
-        z, Pz, z_hist = states
-
-        z_vec = z[..., None]
-        u_vec = u[..., None]
-
-        _, z_hist = self.gru(inputs=z, states=z_hist)
-
-        alpha = self.alpha(z_hist, training=training)
-        alpha = tf.nn.softmax(alpha)
-
-        At = tf.reshape(alpha @ self.As, (-1, self.state_units, self.state_units))
-        Bt = tf.reshape(alpha @ self.Bs, (-1, self.state_units, self.control_units))
-        Ct = tf.reshape(alpha @ self.Cs, (-1, self.observe_units, self.state_units))
-
-        z_vec = At @ z_vec + Bt @ u_vec
-        y_vec = Ct @ z_vec
-
-        Pz = At @ Pz @ tf.transpose(At, (0, 2, 1)) + \
-             Bt @ Pu @ tf.transpose(Bt, (0, 2, 1)) + \
-             tf.eye(self.state_units)[None]
-        Py = Ct @ Pz @ tf.transpose(Ct, (0, 2, 1)) + tf.eye(self.observe_units)[None]
-
-        return [y_vec[..., 0], Py, Ct], [z_vec[..., 0], Pz, z_hist]
-
-    def get_initial_state(self, inputs=None, batch_size=None, dtype=None):
-        return [
-            tf.zeros((batch_size, self.state_units)),                   # z
-            tf.eye(self.state_units, batch_shape=(batch_size,)) * 1e6,  # Pz
-            tf.zeros((batch_size, self.state_history_units)),           # z_hist
-        ]
+    def call(self, inputs, mask=None, training=None):
+        ctrl_inputs_bt2, init_state = inputs
+        gru_state = self.gru(
+            ctrl_inputs_bt2, initial_state=init_state, mask=mask, training=training)
+        z = gru_state[..., :self.state_units]
+        z_log_var = gru_state[..., self.state_units:]
+        return z, z_log_var
 
 class KalmanMeasure(KL.Layer):
     def __init__(self, state_units: int, observe_units: int, **kwargs):
@@ -211,28 +136,44 @@ class KalmanMeasure(KL.Layer):
         self.state_units = state_units
         self.observe_units = observe_units
 
+    def build(self, input_shapes):
+        self.C = self.add_weight(
+            name="C",
+            shape=(self.observe_units, self.state_units),
+            trainable=True,
+        )
+
     def call(self, inputs):
-        r = inputs["y"] - inputs["y_hat"]
-        Ct_T = tf.transpose(inputs["Ct"], (0, 2, 1))
-        S = inputs["Ct"] @ inputs["Pz"] @ Ct_T + \
-            tf.eye(self.observe_units)[None]
-        K = inputs["Pz"] @ Ct_T @ tf.linalg.inv(S)
+        # process prediction
+        z, z_log_var, y = inputs
+        z_vec = z[..., None]
+        Pz = tf.linalg.diag(tf.exp(z_log_var))
 
-        z_vec = inputs["z"][..., None] + K @ r[..., None]
-        Pz = (tf.eye(self.state_units)[None] - K @ inputs["Ct"]) @ inputs["Pz"]
+        C = self.C[None]
+        C_T = tf.linalg.adjoint(C)
 
-        # ensure symmetry
-        Pz = .5 * (Pz + tf.transpose(Pz, (0, 2, 1)))
+        y_hat_vec = C @ z_vec
+        y_hat = y_hat_vec[..., 0]
 
-        # post correction measurement stats
-        y_vec = inputs["Ct"] @ z_vec
-        Py = inputs["Ct"] @ Pz @ Ct_T + tf.eye(self.observe_units)[None]
+        r = y - y_hat
+        S = C @ Pz @ C_T + tf.eye(self.observe_units)[None]
+        K_T = tf.linalg.cholesky_solve(S, C @ Pz)
+        K = tf.linalg.adjoint(K_T)
+
+        Py = C @ Pz @ C_T + tf.eye(self.observe_units)[None]
+
+        z_vec += K @ r[..., None]
+        Pz = (tf.eye(self.state_units)[None] - K @ C) @ Pz
+
+        # corrected measurements
+        y_vec = C @ z_vec
 
         return {
-            "z": z_vec[..., 0],
-            "Pz": Pz,
-            "y": y_vec[..., 0],
-            "Py": Py
+            "z_meas": z_vec[..., 0],
+            "z_log_var_meas": tf.math.log(tf.linalg.diag_part(Pz)),
+            "y_meas": y_vec[..., 0],
+            "y_proc": y_hat,
+            "Py_proc": Py,
         }
 
 class DPNet:
@@ -243,9 +184,7 @@ class DPNet:
         state_enc_units = 32,
         state_units = 3,
         control_units = 2,
-        z_units = 128,
-        z_hist_units = 196,
-        num_linear_modes = 4,
+        z_units = 256,
         mlp_dropout = None,
     )
 
@@ -265,14 +204,7 @@ class DPNet:
             self.p.state_units, 64, 1, self.p.mlp_dropout, name="state_decoder")
         self.z_init_mlp = MLP(self.p.z_units, 256, 1)
 
-        self.dynamics = KL.RNN(LTVDynamics(
-            state_units=self.p.z_units,
-            state_history_units=self.p.z_hist_units,
-            control_units=self.p.control_units,
-            observe_units=self.p.img_enc_units + self.p.state_enc_units,
-            num_modes=self.p.num_linear_modes,
-            name="ltv_dynamics",
-        ), return_state=True)
+        self.dynamics = GRUDynamics(state_units=self.p.z_units)
         self.kalman_meas = KalmanMeasure(
             state_units=self.p.z_units,
             observe_units=self.p.img_enc_units + self.p.state_enc_units,
@@ -286,31 +218,20 @@ class DPNet:
         y = tf.concat([image_code, state_code], axis=-1)
 
         init_z = self.z_init_mlp(y)
+        init_z_log_var = tf.zeros_like(init_z)
 
-        states = self.dynamics.cell.get_initial_state(batch_size=self.data_p.batch_size)
-        return {
-            "init_z": init_z,
-            "init_Pz": states[1],
-            "init_z_hist": states[2],
-        }
+        return {"init_state": tf.concat([init_z, init_z_log_var], axis=-1)}
 
     def build_model(self) -> K.Model:
         img_bhw3 = KL.Input(self.data_p.img_size + (3,), batch_size=self.data_p.batch_size)
         state_b3 = KL.Input((self.p.state_units,), batch_size=self.data_p.batch_size)
         ctrl_mask_bt = KL.Input((None,), batch_size=self.data_p.batch_size, dtype=tf.bool)
         ctrl_inputs_bt2 = KL.Input((None, 2), batch_size=self.data_p.batch_size)
-        init_z = KL.Input((self.p.z_units,), batch_size=self.data_p.batch_size)
-        init_Pz = KL.Input((self.p.z_units, self.p.z_units),
-                           batch_size=self.data_p.batch_size)
-        init_z_hist = KL.Input((self.p.z_hist_units,), batch_size=self.data_p.batch_size)
+        init_state = KL.Input((self.p.z_units*2,), batch_size=self.data_p.batch_size)
 
         # process model
         num_steps = tf.shape(ctrl_mask_bt)[1]
-        ctrl_inputs_cov_bt22 = tf.zeros((self.data_p.batch_size, num_steps, 2, 2))
-        y_hat, Py, Ct, z, Pz, z_hist = self.dynamics(
-            (ctrl_inputs_bt2, ctrl_inputs_cov_bt22),
-            initial_state=[init_z, init_Pz, init_z_hist],
-            mask=ctrl_mask_bt)
+        z, z_log_var = self.dynamics((ctrl_inputs_bt2, init_state), mask=ctrl_mask_bt)
 
         # observation
         img_code = self.img_encoder(img_bhw3)
@@ -319,13 +240,7 @@ class DPNet:
         state_recon = self.state_decoder(state_code)
         y = KL.Concatenate()([img_code, state_code])
 
-        corrected_state = self.kalman_meas({
-            "y": y,
-            "y_hat": y_hat,
-            "z": z,
-            "Pz": Pz,
-            "Ct": Ct,
-        })
+        corrected = self.kalman_meas((z, z_log_var, y))
 
         return K.Model(
             inputs={
@@ -333,20 +248,16 @@ class DPNet:
                 "state_b3": state_b3,
                 "ctrl_mask_bt": ctrl_mask_bt,
                 "ctrl_inputs_bt2": ctrl_inputs_bt2,
-                "init_z": init_z,
-                "init_Pz": init_Pz,
-                "init_z_hist": init_z_hist,
+                "init_state": init_state,
             },
             outputs={
                 "z_proc": z,
-                "Pz_proc": Pz,
+                "z_log_var_proc": z_log_var,
                 "y": y,
-                "y_proc": y_hat,
-                "Py_proc": Py,
-                "z_meas": corrected_state["z"],
-                "Pz_meas": corrected_state["Pz"],
-                "y_meas": corrected_state["y"],
-                "z_hist": z_hist,
+                "y_proc": corrected["y_proc"],
+                "Py_proc": corrected["Py_proc"],
+                "z_meas": corrected["z_meas"],
+                "z_log_var_meas": corrected["z_log_var_meas"],
                 # auxiliary outputs
                 "img_recon": img_recon,
                 "state_recon": state_recon,
