@@ -11,11 +11,10 @@ class NuScenesDataset:
         seq_len = 4,
         max_scene_len = 189,
         batch_size = 32,
-        data_root = "/data/tfrecords/nuScenes/front_cam",
+        data_root = "/arm/u/alvinsun/data/tfrecords/nuScenes/front_cam",
         img_size = (143, 255),
         img_noise = 5.0,
         prefetch = 16,
-
     )
 
     def __init__(self, params: ParamDict = DEFAULT_PARAMS):

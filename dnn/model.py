@@ -119,14 +119,12 @@ class LTVDynamics(KL.Layer):
                  state_units: int,
                  state_history_units: int,
                  control_units: int,
-                 observe_units: int,
                  num_modes: int,
                  **kwargs):
         super(LTVDynamics, self).__init__(**kwargs)
         self.state_units = state_units
         self.state_history_units = state_history_units
         self.control_units = control_units
-        self.observe_units = observe_units
         self.num_modes = num_modes
         self.gru = KL.GRUCell(
             units=state_history_units,
@@ -147,9 +145,8 @@ class LTVDynamics(KL.Layer):
             tf.TensorShape([state_history_units]),      # z_hist
         ]
         self.output_size = [
-            tf.TensorShape([observe_units]),                # y
-            tf.TensorShape([observe_units, observe_units]), # Py
-            tf.TensorShape([observe_units, state_units]),   # Ct
+            tf.TensorShape([state_units]),              # y
+            tf.TensorShape([state_units, state_units]), # Py
         ]
 
     def build(self, input_shapes):
@@ -157,19 +154,13 @@ class LTVDynamics(KL.Layer):
             name="As",
             shape=(self.num_modes, self.state_units * self.state_units),
             trainable=True,
-            initializer=K.initializers.random_normal(stddev=0.05),
+            initializer=K.initializers.random_normal(stddev=0.01),
         )
         self.Bs = self.add_weight(
             name="Bs",
             shape=(self.num_modes, self.state_units * self.control_units),
             trainable=True,
-            initializer=K.initializers.random_normal(stddev=0.05),
-        )
-        self.Cs = self.add_weight(
-            name="Cs",
-            shape=(self.num_modes, self.observe_units * self.state_units),
-            trainable=True,
-            initializer=K.initializers.random_normal(stddev=0.05),
+            initializer=K.initializers.random_normal(stddev=0.01),
         )
 
     def call(self, inputs, states, training=None):
@@ -186,17 +177,16 @@ class LTVDynamics(KL.Layer):
 
         At = tf.reshape(alpha @ self.As, (-1, self.state_units, self.state_units))
         Bt = tf.reshape(alpha @ self.Bs, (-1, self.state_units, self.control_units))
-        Ct = tf.reshape(alpha @ self.Cs, (-1, self.observe_units, self.state_units))
 
         z_vec = At @ z_vec + Bt @ u_vec
-        y_vec = Ct @ z_vec
+        y_vec = z_vec
 
         Pz = At @ Pz @ tf.transpose(At, (0, 2, 1)) + \
              Bt @ Pu @ tf.transpose(Bt, (0, 2, 1)) + \
              tf.eye(self.state_units)[None]
-        Py = Ct @ Pz @ tf.transpose(Ct, (0, 2, 1)) + tf.eye(self.observe_units)[None]
+        Py = Pz + tf.eye(self.state_units)[None]
 
-        return [y_vec[..., 0], Py, Ct], [z_vec[..., 0], Pz, z_hist]
+        return [y_vec[..., 0], Py], [z_vec[..., 0], Pz, z_hist]
 
     def get_initial_state(self, inputs=None, batch_size=None, dtype=None):
         return [
@@ -206,27 +196,25 @@ class LTVDynamics(KL.Layer):
         ]
 
 class KalmanMeasure(KL.Layer):
-    def __init__(self, state_units: int, observe_units: int, **kwargs):
+    def __init__(self, state_units: int, **kwargs):
         super(KalmanMeasure, self).__init__(**kwargs)
         self.state_units = state_units
-        self.observe_units = observe_units
 
     def call(self, inputs):
         r = inputs["y"] - inputs["y_hat"]
-        Ct_T = tf.transpose(inputs["Ct"], (0, 2, 1))
-        S = inputs["Ct"] @ inputs["Pz"] @ Ct_T + \
-            tf.eye(self.observe_units)[None]
-        K = inputs["Pz"] @ Ct_T @ tf.linalg.inv(S)
+        S = inputs["Pz"] + \
+            tf.eye(self.state_units)[None]
+        K = inputs["Pz"] @ tf.linalg.inv(S)
 
         z_vec = inputs["z"][..., None] + K @ r[..., None]
-        Pz = (tf.eye(self.state_units)[None] - K @ inputs["Ct"]) @ inputs["Pz"]
+        Pz = (tf.eye(self.state_units)[None] - K) @ inputs["Pz"]
 
         # ensure symmetry
         Pz = .5 * (Pz + tf.transpose(Pz, (0, 2, 1)))
 
         # post correction measurement stats
-        y_vec = inputs["Ct"] @ z_vec
-        Py = inputs["Ct"] @ Pz @ Ct_T + tf.eye(self.observe_units)[None]
+        y_vec = z_vec
+        Py = Pz + tf.eye(self.state_units)[None]
 
         return {
             "z": z_vec[..., 0],
@@ -239,13 +227,11 @@ class DPNet:
 
     DEFAULT_PARAMS = ParamDict(
         img_enc_units = 128,
-        img_units = 128,
         state_enc_units = 32,
         state_units = 3,
         control_units = 2,
-        z_units = 128,
-        z_hist_units = 196,
-        num_linear_modes = 4,
+        z_hist_units = 128,
+        num_linear_modes = 8,
         mlp_dropout = None,
     )
 
@@ -263,19 +249,16 @@ class DPNet:
             self.p.state_enc_units, 64, 1, self.p.mlp_dropout, name="state_encoder")
         self.state_decoder = MLP(
             self.p.state_units, 64, 1, self.p.mlp_dropout, name="state_decoder")
-        self.z_init_mlp = MLP(self.p.z_units, 256, 1)
 
         self.dynamics = KL.RNN(LTVDynamics(
-            state_units=self.p.z_units,
+            state_units=self.p.img_enc_units + self.p.state_enc_units,
             state_history_units=self.p.z_hist_units,
             control_units=self.p.control_units,
-            observe_units=self.p.img_enc_units + self.p.state_enc_units,
             num_modes=self.p.num_linear_modes,
             name="ltv_dynamics",
         ), return_state=True)
         self.kalman_meas = KalmanMeasure(
-            state_units=self.p.z_units,
-            observe_units=self.p.img_enc_units + self.p.state_enc_units,
+            state_units=self.p.img_enc_units + self.p.state_enc_units,
             name="kalman_meas",
         )
         self.model = self.build_model()
@@ -285,11 +268,9 @@ class DPNet:
         state_code = self.state_encoder(state_b3)
         y = tf.concat([image_code, state_code], axis=-1)
 
-        init_z = self.z_init_mlp(y)
-
         states = self.dynamics.cell.get_initial_state(batch_size=self.data_p.batch_size)
         return {
-            "init_z": init_z,
+            "init_z": y,
             "init_Pz": states[1],
             "init_z_hist": states[2],
         }
@@ -299,15 +280,16 @@ class DPNet:
         state_b3 = KL.Input((self.p.state_units,), batch_size=self.data_p.batch_size)
         ctrl_mask_bt = KL.Input((None,), batch_size=self.data_p.batch_size, dtype=tf.bool)
         ctrl_inputs_bt2 = KL.Input((None, 2), batch_size=self.data_p.batch_size)
-        init_z = KL.Input((self.p.z_units,), batch_size=self.data_p.batch_size)
-        init_Pz = KL.Input((self.p.z_units, self.p.z_units),
+        z_units = self.p.state_enc_units + self.p.img_enc_units
+        init_z = KL.Input((z_units,), batch_size=self.data_p.batch_size)
+        init_Pz = KL.Input((z_units, z_units),
                            batch_size=self.data_p.batch_size)
         init_z_hist = KL.Input((self.p.z_hist_units,), batch_size=self.data_p.batch_size)
 
         # process model
         num_steps = tf.shape(ctrl_mask_bt)[1]
         ctrl_inputs_cov_bt22 = tf.zeros((self.data_p.batch_size, num_steps, 2, 2))
-        y_hat, Py, Ct, z, Pz, z_hist = self.dynamics(
+        y_hat, Py, z, Pz, z_hist = self.dynamics(
             (ctrl_inputs_bt2, ctrl_inputs_cov_bt22),
             initial_state=[init_z, init_Pz, init_z_hist],
             mask=ctrl_mask_bt)
@@ -324,7 +306,6 @@ class DPNet:
             "y_hat": y_hat,
             "z": z,
             "Pz": Pz,
-            "Ct": Ct,
         })
 
         return K.Model(
@@ -350,7 +331,6 @@ class DPNet:
                 # auxiliary outputs
                 "img_recon": img_recon,
                 "state_recon": state_recon,
-                "init_z": self.z_init_mlp(y),
             },
         )
 
