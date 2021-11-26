@@ -13,7 +13,9 @@ class MLP(KL.Layer):
                  output_units: int,
                  hidden_units: int,
                  num_layers: int,
+                 has_bn: bool = False,
                  dropout: T.Optional[float] = None,
+                 last_activation: T.Optional[str] = None,
                  **kwargs):
         super(MLP, self).__init__(**kwargs)
         self.output_units = output_units
@@ -30,15 +32,20 @@ class MLP(KL.Layer):
             # fully connected layer
             layers.append(KL.Dense(
                 units=hidden_units,
-                activation="elu",
-                #kernel_regularizer=K.regularizers.l2(1e-4),
-                #bias_regularizer=K.regularizers.l2(1e-4),
             ))
+
+            # batchnorm
+            if has_bn:
+                layers.append(KL.BatchNormalization())
+
+            # activation
+            layers.append(KL.ReLU())
+
             # dropout
             if dropout is not None:
                 layers.append(KL.Dropout(dropout))
 
-        layers.append(KL.Dense(self.output_units))
+        layers.append(KL.Dense(self.output_units, activation=last_activation))
 
         self.f = K.Sequential(layers)
 
@@ -51,22 +58,23 @@ class ImageEncoder(KL.Layer):
         self.units = units
         self.dropout = dropout
 
-        reg = None #K.regularizers.l2(1e-4)
         self.cnn = K.Sequential([
-            KL.Conv2D(24, 7, 2, activation="elu", kernel_regularizer=reg, bias_regularizer=reg),
-            KL.Conv2D(24, 5, 1, activation="elu", kernel_regularizer=reg, bias_regularizer=reg),
-            KL.Conv2D(48, 5, 2, activation="elu", kernel_regularizer=reg, bias_regularizer=reg),
-            KL.Conv2D(48, 3, 1, activation="elu", kernel_regularizer=reg, bias_regularizer=reg),
-            KL.Conv2D(72, 3, 2, activation="elu", kernel_regularizer=reg, bias_regularizer=reg),
-            KL.Conv2D(72, 3, 1, activation="elu", kernel_regularizer=reg, bias_regularizer=reg),
-            KL.Conv2D(96, 3, 2, activation="elu", kernel_regularizer=reg, bias_regularizer=reg),
-            KL.Conv2D(96, 3, 1, activation="elu", kernel_regularizer=reg, bias_regularizer=reg),
-            KL.Conv2D(128, 3, 2, activation="elu", kernel_regularizer=reg, bias_regularizer=reg),
+            KL.Conv2D(24, 7, 2, "same", activation="relu"),
+            KL.Conv2D(24, 7, 1, "same", activation="relu"),
+            KL.Conv2D(48, 5, 2, "same", activation="relu"),
+            KL.Conv2D(48, 5, 1, "same", activation="relu"),
+            KL.Conv2D(96, 3, 2, "same", activation="relu"),
+            KL.Conv2D(96, 3, 1, "same", activation="relu"),
+            KL.Conv2D(144, 3, 2, "same", activation="relu"),
+            KL.Conv2D(144, 3, 1, "valid", activation="relu"),
+            KL.Conv2D(192, 3, 1, "valid", activation="relu"),
+            KL.Conv2D(192, 3, 1, "valid", activation="relu"),
+            KL.Conv2D(256, 3, 1, "valid", activation="relu"),
         ])
-        self.mlp = MLP(units, hidden_units=512, num_layers=1, dropout=dropout)
+        self.mlp = MLP(units, hidden_units=1024, num_layers=1, dropout=dropout)
 
     def call(self, x, training=None):
-        x = self.cnn(x)
+        x = self.cnn(x, training=training)
         x = KL.Flatten()(x)
         x = self.mlp(x, training=training)
 
@@ -78,33 +86,26 @@ class ImageDecoder(KL.Layer):
         self.feat_shape = feat_shape
         self.dropout = dropout
 
-        reg = None #K.regularizers.l2(1e-4)
-        self.mlp = MLP(math.prod(feat_shape), hidden_units=512, num_layers=1, dropout=dropout)
+        self.mlp = MLP(math.prod(feat_shape), hidden_units=1024, num_layers=1, dropout=dropout, last_activation="relu")
+        self.reshape = KL.Reshape(feat_shape)
         self.decnn = K.Sequential([
-            KL.Conv2DTranspose(96, 3, 2, activation="elu", output_padding=(0, 1),
-                               kernel_regularizer=reg, bias_regularizer=reg),
-            KL.Conv2DTranspose(96, 3, 1, activation="elu",
-                               kernel_regularizer=reg, bias_regularizer=reg),
-            KL.Conv2DTranspose(72, 3, 2, activation="elu", output_padding=1,
-                               kernel_regularizer=reg, bias_regularizer=reg),
-            KL.Conv2DTranspose(72, 3, 1, activation="elu",
-                               kernel_regularizer=reg, bias_regularizer=reg),
-            KL.Conv2DTranspose(48, 3, 2, activation="elu",
-                               kernel_regularizer=reg, bias_regularizer=reg),
-            KL.Conv2DTranspose(48, 3, 1, activation="elu",
-                               kernel_regularizer=reg, bias_regularizer=reg),
-            KL.Conv2DTranspose(24, 5, 2, activation="elu",
-                               kernel_regularizer=reg, bias_regularizer=reg),
-            KL.Conv2DTranspose(24, 5, 1, activation="elu",
-                               kernel_regularizer=reg, bias_regularizer=reg),
-            KL.Conv2DTranspose(3, 7, 2, activation=None,
-                               kernel_regularizer=reg, bias_regularizer=reg),
+            KL.Conv2DTranspose(192, 3, 1, "valid", activation="relu"),
+            KL.Conv2DTranspose(192, 3, 1, "valid", activation="relu"),
+            KL.Conv2DTranspose(144, 3, 1, "valid", activation="relu"),
+            KL.Conv2DTranspose(144, 3, 1, "valid", activation="relu"),
+            KL.Conv2DTranspose(96, 3, 2, "same", activation="relu"),
+            KL.Conv2DTranspose(96, 3, 1, "same", activation="relu"),
+            KL.Conv2DTranspose(48, 3, 2, "same", activation="relu"),
+            KL.Conv2DTranspose(48, 5, 1, "same", activation="relu"),
+            KL.Conv2DTranspose(24, 5, 2, "same", activation="relu"),
+            KL.Conv2DTranspose(24, 7, 1, "same", activation="relu"),
+            KL.Conv2DTranspose(3, 7, 2, "same"),
         ])
 
     def call(self, x, training=None):
         x = self.mlp(x, training=training)
-        x = KL.Reshape(self.feat_shape)(x)
-        x = self.decnn(x)
+        x = self.reshape(x)
+        x = self.decnn(x, training=training)
 
         return x
 
@@ -128,9 +129,6 @@ class LTVDynamics(KL.Layer):
         self.num_modes = num_modes
         self.gru = KL.GRUCell(
             units=state_history_units,
-            #kernel_regularizer=K.regularizers.l2(1e-4),
-            #recurrent_regularizer=K.regularizers.l2(1e-4),
-            #bias_regularizer=K.regularizers.l2(1e-4),
         )
         self.alpha = MLP(
             output_units=num_modes,
@@ -154,13 +152,13 @@ class LTVDynamics(KL.Layer):
             name="As",
             shape=(self.num_modes, self.state_units * self.state_units),
             trainable=True,
-            initializer=K.initializers.random_normal(stddev=0.01),
+            initializer=K.initializers.random_normal(stddev=0.05),
         )
         self.Bs = self.add_weight(
             name="Bs",
             shape=(self.num_modes, self.state_units * self.control_units),
             trainable=True,
-            initializer=K.initializers.random_normal(stddev=0.01),
+            initializer=K.initializers.random_normal(stddev=0.05),
         )
 
     def call(self, inputs, states, training=None):
@@ -169,6 +167,9 @@ class LTVDynamics(KL.Layer):
 
         z_vec = z[..., None]
         u_vec = u[..., None]
+
+        y_vec = z_vec
+        Py = Pz + tf.eye(self.state_units)[None]
 
         _, z_hist = self.gru(inputs=z, states=z_hist)
 
@@ -179,20 +180,18 @@ class LTVDynamics(KL.Layer):
         Bt = tf.reshape(alpha @ self.Bs, (-1, self.state_units, self.control_units))
 
         z_vec = At @ z_vec + Bt @ u_vec
-        y_vec = z_vec
 
         Pz = At @ Pz @ tf.transpose(At, (0, 2, 1)) + \
              Bt @ Pu @ tf.transpose(Bt, (0, 2, 1)) + \
              tf.eye(self.state_units)[None]
-        Py = Pz + tf.eye(self.state_units)[None]
 
         return [y_vec[..., 0], Py], [z_vec[..., 0], Pz, z_hist]
 
     def get_initial_state(self, inputs=None, batch_size=None, dtype=None):
         return [
-            tf.zeros((batch_size, self.state_units)),                   # z
-            tf.eye(self.state_units, batch_shape=(batch_size,)) * 1e6,  # Pz
-            tf.zeros((batch_size, self.state_history_units)),           # z_hist
+            tf.zeros((batch_size, self.state_units)),               # z
+            tf.eye(self.state_units, batch_shape=(batch_size,)),    # Pz
+            tf.zeros((batch_size, self.state_history_units)),       # z_hist
         ]
 
 class KalmanMeasure(KL.Layer):
@@ -227,7 +226,7 @@ class DPNet:
 
     DEFAULT_PARAMS = ParamDict(
         img_enc_units = 128,
-        state_enc_units = 32,
+        state_enc_units = 16,
         state_units = 3,
         control_units = 2,
         z_hist_units = 128,
@@ -244,11 +243,12 @@ class DPNet:
         self.img_encoder = ImageEncoder(self.p.img_enc_units, dropout=self.p.mlp_dropout)
         image_shape = (None,) + self.data_p.img_size + (3,)
         feat_shape = self.img_encoder.cnn.compute_output_shape(image_shape)
+        print("Image feature shape:", feat_shape)
         self.img_decoder = ImageDecoder(feat_shape[1:], dropout=self.p.mlp_dropout)
         self.state_encoder = MLP(
-            self.p.state_enc_units, 64, 1, self.p.mlp_dropout, name="state_encoder")
+            self.p.state_enc_units, 32, 2, self.p.mlp_dropout, name="state_encoder")
         self.state_decoder = MLP(
-            self.p.state_units, 64, 1, self.p.mlp_dropout, name="state_decoder")
+            self.p.state_units, 32 , 2, self.p.mlp_dropout, name="state_decoder")
 
         self.dynamics = KL.RNN(LTVDynamics(
             state_units=self.p.img_enc_units + self.p.state_enc_units,
@@ -263,9 +263,9 @@ class DPNet:
         )
         self.model = self.build_model()
 
-    def get_init_state(self, image_bhw3, state_b3):
-        image_code = self.img_encoder(image_bhw3)
-        state_code = self.state_encoder(state_b3)
+    def get_init_state(self, image_bhw3, state_b3, training=None):
+        image_code = self.img_encoder(image_bhw3, training=training)
+        state_code = self.state_encoder(state_b3, training=training)
         y = tf.concat([image_code, state_code], axis=-1)
 
         states = self.dynamics.cell.get_initial_state(batch_size=self.data_p.batch_size)
