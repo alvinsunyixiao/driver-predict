@@ -60,11 +60,8 @@ class ImageEncoder(KL.Layer):
 
         self.cnn = K.Sequential([
             KL.Conv2D(24, 7, 2, "same", activation="relu"),
-            KL.Conv2D(24, 7, 1, "same", activation="relu"),
             KL.Conv2D(48, 5, 2, "same", activation="relu"),
-            KL.Conv2D(48, 5, 1, "same", activation="relu"),
-            KL.Conv2D(96, 3, 2, "same", activation="relu"),
-            KL.Conv2D(96, 3, 1, "same", activation="relu"),
+            KL.Conv2D(96, 5, 2, "same", activation="relu"),
             KL.Conv2D(144, 3, 2, "same", activation="relu"),
             KL.Conv2D(144, 3, 1, "valid", activation="relu"),
             KL.Conv2D(192, 3, 1, "valid", activation="relu"),
@@ -94,11 +91,8 @@ class ImageDecoder(KL.Layer):
             KL.Conv2DTranspose(144, 3, 1, "valid", activation="relu"),
             KL.Conv2DTranspose(144, 3, 1, "valid", activation="relu"),
             KL.Conv2DTranspose(96, 3, 2, "same", activation="relu"),
-            KL.Conv2DTranspose(96, 3, 1, "same", activation="relu"),
-            KL.Conv2DTranspose(48, 3, 2, "same", activation="relu"),
-            KL.Conv2DTranspose(48, 5, 1, "same", activation="relu"),
+            KL.Conv2DTranspose(48, 5, 2, "same", activation="relu"),
             KL.Conv2DTranspose(24, 5, 2, "same", activation="relu"),
-            KL.Conv2DTranspose(24, 7, 1, "same", activation="relu"),
             KL.Conv2DTranspose(3, 7, 2, "same"),
         ])
 
@@ -148,17 +142,21 @@ class LTVDynamics(KL.Layer):
         ]
 
     def build(self, input_shapes):
+        A_eye = tf.eye(self.state_units, batch_shape=(self.num_modes,))
+        A_eye = tf.reshape(A_eye, (self.num_modes, self.state_units * self.state_units))
         self.As = self.add_weight(
             name="As",
             shape=(self.num_modes, self.state_units * self.state_units),
             trainable=True,
-            initializer=K.initializers.random_normal(stddev=0.05),
+            initializer=K.initializers.constant(A_eye),
+            regularizer=K.regularizers.l1_l2(l1=1e-4, l2=1e-4),
         )
         self.Bs = self.add_weight(
             name="Bs",
             shape=(self.num_modes, self.state_units * self.control_units),
             trainable=True,
-            initializer=K.initializers.random_normal(stddev=0.05),
+            initializer=K.initializers.random_normal(stddev=1.0),
+            regularizer=K.regularizers.l1(1e-4),
         )
 
     def call(self, inputs, states, training=None):
@@ -181,9 +179,12 @@ class LTVDynamics(KL.Layer):
 
         z_vec = At @ z_vec + Bt @ u_vec
 
-        Pz = At @ Pz @ tf.transpose(At, (0, 2, 1)) + \
-             Bt @ Pu @ tf.transpose(Bt, (0, 2, 1)) + \
+        Pz = At @ Pz @ tf.linalg.adjoint(At) + \
+             Bt @ Pu @ tf.linalg.adjoint(Bt) + \
              tf.eye(self.state_units)[None]
+        Pz = Pz + tf.eye(self.state_units)[None]
+
+        Pz = .5 * (Pz + tf.linalg.adjoint(Pz))
 
         return [y_vec[..., 0], Py], [z_vec[..., 0], Pz, z_hist]
 
@@ -203,13 +204,14 @@ class KalmanMeasure(KL.Layer):
         r = inputs["y"] - inputs["y_hat"]
         S = inputs["Pz"] + \
             tf.eye(self.state_units)[None]
-        K = inputs["Pz"] @ tf.linalg.inv(S)
+        K_T = tf.linalg.solve(S, inputs["Pz"])
+        K = tf.linalg.adjoint(K_T)
 
         z_vec = inputs["z"][..., None] + K @ r[..., None]
         Pz = (tf.eye(self.state_units)[None] - K) @ inputs["Pz"]
 
         # ensure symmetry
-        Pz = .5 * (Pz + tf.transpose(Pz, (0, 2, 1)))
+        Pz = .5 * (Pz + tf.linalg.adjoint(Pz))
 
         # post correction measurement stats
         y_vec = z_vec
@@ -246,9 +248,9 @@ class DPNet:
         print("Image feature shape:", feat_shape)
         self.img_decoder = ImageDecoder(feat_shape[1:], dropout=self.p.mlp_dropout)
         self.state_encoder = MLP(
-            self.p.state_enc_units, 32, 2, self.p.mlp_dropout, name="state_encoder")
+            self.p.state_enc_units, 32, 4, self.p.mlp_dropout, name="state_encoder")
         self.state_decoder = MLP(
-            self.p.state_units, 32 , 2, self.p.mlp_dropout, name="state_decoder")
+            self.p.state_units, 32 , 4, self.p.mlp_dropout, name="state_decoder")
 
         self.dynamics = KL.RNN(LTVDynamics(
             state_units=self.p.img_enc_units + self.p.state_enc_units,
