@@ -22,18 +22,13 @@ class LossManager:
         return -tf.reduce_mean(y_proc_dist.log_prob(y))
 
     def decoded_loss(self, img_bhw3, state_b3, y, y_proc_dist):
-        y_proc_sample = y_proc_dist.sample()
-
-        # weight reconstruction loss by log probability
-        weights = tf.stop_gradient(y_proc_dist.log_prob(y))
-        weights = weights / tf.reduce_sum(weights)
+        y_proc_sample = y
 
         # decoded image loss
         img_code = y_proc_sample[:, :self.net.p.img_enc_units]
         img_recon = self.net.img_decoder(img_code)
-        img_loss = tf.reduce_mean(tf.square(img_recon - img_bhw3), axis=(1, 2, 3))
+        img_loss = tf.reduce_sum(tf.square(img_recon - img_bhw3), axis=-1)
         img_loss = tf.reduce_mean(img_loss)
-        #img_loss = tf.reduce_sum(img_loss * weights)
 
         # decoded state loss
         state_code = y_proc_sample[:, self.net.p.img_enc_units:]
@@ -51,8 +46,7 @@ class LossManager:
         rot_diff = tf.atan2(tf.sin(rot_diff), tf.cos(rot_diff))
         rot_loss = tf.square(rot_diff)
 
-        state_loss = tf.reduce_mean(pos_loss + rot_loss)
-        #state_loss = tf.reduce_sum((pos_loss + rot_loss) * weights)
+        state_loss = tf.reduce_mean((pos_loss + rot_loss))
 
         return img_loss, state_loss
 
