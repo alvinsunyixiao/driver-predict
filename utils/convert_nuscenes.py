@@ -1,6 +1,7 @@
 import argparse
 import io
 import os
+import random
 import typing as T
 
 import numpy as np
@@ -33,6 +34,8 @@ class NuScenesConverter:
                             help="directory to store the output tfrecords")
         parser.add_argument("--data-root", type=str, default="/mnt/data/nuScenes",
                             help="root directory to the nuScenes datastet")
+        parser.add_argument("--split", type=float, default=0.9,
+                            help="the train percentage of a train-val split [default to 0.9]")
         return parser.parse_args()
 
     def _parse_sample_data(self,
@@ -82,7 +85,7 @@ class NuScenesConverter:
             "can_timestamp":    const_to_feature([ctrl["utime"] for ctrl in ctrls], dtype=tf.uint64),
         }
 
-    def _convert_scene(self, scene: T.Dict[str, T.Any]):
+    def _convert_scene(self, scene: T.Dict[str, T.Any], tag: str):
         first_sample = self.nusc.get("sample", scene["first_sample_token"])
         if self.args.front_cam_only:
             cameras = ["CAM_FRONT"]
@@ -94,7 +97,9 @@ class NuScenesConverter:
         ctrl_inp = self.nusc_can.get_messages(scene["name"], "pose")
         ctrl_idx = 0
 
-        tfrecord_file = os.path.join(self.args.output_dir,
+        tfrecord_root = os.path.join(self.args.output_dir, tag)
+        os.makedirs(tfrecord_root, exist_ok=True)
+        tfrecord_file = os.path.join(tfrecord_root,
                                      scene["name"] + ".tfrecord")
         with tf.io.TFRecordWriter(tfrecord_file) as writer:
             while data_dict:
@@ -120,14 +125,18 @@ class NuScenesConverter:
                     data_dict.pop(min_t_cam)
 
     def main(self):
-        for scene in tqdm(self.nusc.scene):
-            # skip scenes that do not have CAN data
-            if (scene["name"] in self._scene_black_list):
-                continue
+        scenes = [scene for scene in self.nusc.scene if scene["name"] not in self._scene_black_list]
+        random.shuffle(scenes)
+        num_train = int(len(scenes) * self.args.split)
 
-            # convert scene data to TFRecord
-            self._convert_scene(scene)
+        train_scenes = scenes[:num_train]
+        val_scenes = scenes[num_train:]
 
+        for scene in tqdm(train_scenes):
+            self._convert_scene(scene, "train")
+
+        for scene in tqdm(val_scenes):
+            self._convert_scene(scene, "validation")
 
 if __name__ == "__main__":
     set_tf_memory_growth()

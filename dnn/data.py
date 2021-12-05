@@ -8,22 +8,27 @@ from utils.params import ParamDict
 class NuScenesDataset:
 
     DEFAULT_PARAMS = ParamDict(
-        seq_len = 16,
+        seq_len = 24,
         max_scene_len = 189,
-        batch_size = 32,
+        batch_size = 16,
         data_root = "/data/tfrecords/nuScenes/front_cam",
-        img_size = (144, 256),
+        img_size = (96, 160),
         img_noise = 5.0,
-        prefetch = 16,
+        prefetch = 128,
+        shuffle = 100,
     )
 
     def __init__(self, params: ParamDict = DEFAULT_PARAMS):
         self.p = params
-        self.dataset = self.build_dataset()
+        self.train_dataset = self.build_dataset("train")
+        self.val_dataset = self.build_dataset("validation")
 
-    def build_dataset(self):
-        file_dataset = tf.data.Dataset.list_files(os.path.join(self.p.data_root, "*.tfrecord"))
-        file_dataset = file_dataset.repeat().shuffle(100)
+    def build_dataset(self, tag: str):
+        file_dataset = tf.data.Dataset.list_files(os.path.join(self.p.data_root, tag, "*.tfrecord"))
+        file_dataset = file_dataset.repeat()
+
+        if tag == "train":
+            file_dataset = file_dataset.shuffle(self.p.shuffle)
 
         interleaved_dataset = file_dataset.interleave(self._interleave_func,
             cycle_length=self.p.batch_size, num_parallel_calls=8, deterministic=True)
@@ -68,7 +73,8 @@ class NuScenesDataset:
 
         image_hw3 = tf.image.resize(image_hw3, self.p.img_size)
         image_hw3 += tf.random.normal(shape=tf.shape(image_hw3), stddev=self.p.img_noise)
-        image_hw3 = image_hw3 / 127.5 - 1
+        image_hw3 = image_hw3 / 127.5 - 1.0
+        image_hw3 = tf.clip_by_value(image_hw3, -1.0, 1.0)
 
         state_b3 = tf.concat([world_t_ego_3[:-1], world_Rxyz_ego[-1, None]], axis=0)
         ctrl_inputs_t2 = tf.concat(

@@ -1,4 +1,5 @@
 import tensorflow as tf
+import tensorflow.keras as K
 import tensorflow_probability as tfp
 
 from dnn.model import DPNet
@@ -24,5 +25,11 @@ class LossManager:
         rot_diff_b = tf.atan2(tf.sin(rot_diff_b), tf.cos(rot_diff_b))
         rot_loss_b = tf.square(rot_diff_b)
 
-        return tf.reduce_mean(poss_loss_b + rot_loss_b)
+        return tf.reduce_mean(pos_loss_b + rot_loss_b)
+
+    def dynamics_loss(self, z, y):
+        z = tf.clip_by_value(z, -1.0 + 1e-4, 1.0 - 1e-4)
+        y = tf.clip_by_value(y, -1.0 + 1e-4, 1.0 - 1e-4)
+        loss_b = tf.reduce_sum(tf.square(tf.atanh(z) - tf.atanh(y)), axis=-1)
+        return tf.reduce_mean(loss_b)
 
